@@ -1,0 +1,347 @@
+name: codex-security-fix
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  request:
+    if: >-
+      !github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/codex-security-fix ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      security-events: read
+    outputs:
+      authorized: ${{ steps.request.outputs.authorized }}
+      alert_number: ${{ steps.request.outputs.alert_number }}
+      base_sha: ${{ steps.request.outputs.base_sha }}
+      base_branch: ${{ steps.request.outputs.base_branch }}
+    steps:
+      - name: Authorize commenter and load the alert
+        id: request
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const comment = context.payload.comment;
+            const match = comment.body.trim().match(/^\/codex-security-fix ([1-9]\d*)$/);
+            if (!match || !Number.isSafeInteger(Number(match[1]))) {
+              throw new Error('Use: /codex-security-fix <positive-alert-number>');
+            }
+            if (comment.user.type !== 'User') throw new Error('Human commenters only.');
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner, repo, username: comment.user.login
+            });
+            if (!['write', 'admin'].includes(access.permission)) {
+              throw new Error('Repository write access is required.');
+            }
+            core.setOutput('authorized', 'true');
+            const alertNumber = Number(match[1]);
+            const baseBranch = context.payload.repository.default_branch;
+            const { data: alert } = await github.rest.codeScanning.getAlert({
+              owner, repo, alert_number: alertNumber
+            });
+            const instances = await github.paginate(github.rest.codeScanning.listAlertInstances, {
+              owner, repo, alert_number: alertNumber,
+              ref: `refs/heads/${baseBranch}`, per_page: 100
+            });
+            const openInstances = instances.filter(instance => instance.state === 'open');
+            if (alert.state !== 'open' || openInstances.length === 0) {
+              throw new Error('The alert must be open on the default branch.');
+            }
+            const fs = require('fs');
+            const path = require('path');
+            const directory = path.join(process.env.RUNNER_TEMP, 'security-request');
+            fs.mkdirSync(directory, { recursive: true });
+            fs.writeFileSync(path.join(directory, 'alert.json'), JSON.stringify({
+              ...alert,
+              most_recent_instance: openInstances[0],
+              default_branch_instances: openInstances,
+              target_repository: `${owner}/${repo}`,
+              target_revision: context.sha
+            }, null, 2));
+            core.setOutput('alert_number', String(alertNumber));
+            core.setOutput('base_sha', context.sha);
+            core.setOutput('base_branch', baseBranch);
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: context.issue.number,
+              body: `Working on code-scanning alert #${alertNumber}. [Follow the run](${runUrl}). A draft PR will be created only if verification returns fixed.`
+            });
+
+      - name: Pass the alert to the remediation job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/security-request/alert.json
+          if-no-files-found: error
+          retention-days: 1
+
+  remediate:
+    needs: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.fix.outputs.outcome }}
+      patch_sha256: ${{ steps.fix.outputs.patch_sha256 }}
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install the pinned Codex Security CLI outside the checkout
+        run: >-
+          npm install --prefix "$RUNNER_TEMP/security-cli"
+          --ignore-scripts --no-audit --no-fund @openai/codex-security@0.1.24
+
+      - name: Check out the default-branch revision from the triggering event
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.request.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the selected alert
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: security-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/security-request
+
+      # Optional repository variables, maintained by repository administrators.
+      # For example: SETUP = npm ci; TEST = npm test -- --runInBand
+      - name: Install repository dependencies if configured
+        env:
+          SETUP_COMMAND: ${{ vars.SECURITY_FIX_SETUP_COMMAND }}
+        run: |
+          if [ -n "$SETUP_COMMAND" ]; then
+            bash -e -o pipefail -c "$SETUP_COMMAND"
+          fi
+
+      - name: Generate the patch and independently verify it
+        id: fix
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+          BASE_SHA: ${{ needs.request.outputs.base_sha }}
+          TEST_COMMAND: ${{ vars.SECURITY_FIX_TEST_COMMAND }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess
+
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          result = temp / 'security-result'
+          result.mkdir(exist_ok=True)
+          cli = temp / 'security-cli/node_modules/.bin/codex-security'
+          alert = temp / 'security-request/alert.json'
+          base = os.environ['BASE_SHA']
+          if not os.environ.get('CODEX_API_KEY'):
+              raise RuntimeError('Add the CODEX_SECURITY_API_KEY Actions secret.')
+
+          # Do not pass GitHub tokens or workflow control-file paths to Codex.
+          clean_env = {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG') if k in os.environ}
+          clean_env.update(CI='true', CODEX_SECURITY_STATE_DIR=str(temp / 'security-state'))
+          agent_env = dict(clean_env, CODEX_API_KEY=os.environ['CODEX_API_KEY'])
+
+          def git(*args):
+              return subprocess.check_output([
+                  'git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                  *args
+              ], cwd=root, env=clean_env)
+
+          def candidate():
+              if git('rev-parse', 'HEAD').decode().strip() != base:
+                  raise RuntimeError('Codex changed HEAD; refusing to publish.')
+              git('add', '--all')
+              names = git('diff', '--cached', '--name-only', '-z', base).decode().split('\0')
+              for name in filter(None, names):
+                  parts = pathlib.PurePosixPath(name).parts
+                  forbidden = {'.github', '.git', '.codex', '.agents', '.gitattributes',
+                               '.gitmodules', 'AGENTS.md', 'node_modules', '.venv'}
+                  if any(part in forbidden or part.startswith('.env') for part in parts):
+                      raise RuntimeError('Patch touches a protected configuration or generated path: ' + name)
+              modes = git('diff', '--cached', '--raw', base).decode().splitlines()
+              if any(line.split()[1] not in ('000000', '100644', '100755') for line in modes):
+                  raise RuntimeError('Symlink and submodule changes require manual review.')
+              patch = git('diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', base)
+              if len(patch) > 1024 * 1024 or len(list(filter(None, names))) > 30:
+                  raise RuntimeError('Patch is too large for automatic publication.')
+              return patch
+
+          if git('status', '--porcelain').strip():
+              raise RuntimeError('Repository setup must leave a clean Git checkout.')
+          with (result / 'patch.log').open('w') as log:
+              subprocess.run([str(cli), 'patch', str(alert)], cwd=root,
+                             env=agent_env, stdout=log, stderr=log, check=True)
+          patch = candidate()
+
+          # A configured test command receives no OpenAI or GitHub credentials.
+          test_command = os.environ.get('TEST_COMMAND', '').strip()
+          if test_command:
+              with (result / 'tests.log').open('w') as log:
+                  subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', test_command],
+                                 cwd=root, env=clean_env, stdout=log, stderr=log, check=True)
+              if candidate() != patch:
+                  raise RuntimeError('Tests modified the candidate patch.')
+
+          with (result / 'verification.json').open('w') as out, (result / 'verification.log').open('w') as log:
+              verification = subprocess.run([str(cli), 'verify-fix', str(alert), '--json'],
+                  cwd=root, env=agent_env, stdout=out, stderr=log)
+          data = json.loads((result / 'verification.json').read_text())
+          checks = data.get('results', [])
+          if verification.returncode != 0 or len(checks) != 1:
+              raise RuntimeError('Verification failed or was inconclusive; no PR will be created.')
+          check = checks[0]
+          if check.get('id') != 'finding-1' or check.get('status') != 'fixed' or not check.get('evidence', '').strip():
+              raise RuntimeError('An evidence-backed fixed verdict is required.')
+          if candidate() != patch:
+              raise RuntimeError('Verification modified the candidate patch.')
+
+          (result / 'candidate.diff').write_bytes(patch)
+          digest = hashlib.sha256(patch).hexdigest()
+          outcome = 'verified' if patch else 'no_change'
+          (result / 'result.json').write_text(json.dumps({
+              'base_sha': base, 'patch_sha256': digest, 'outcome': outcome,
+              'configured_tests_ran': bool(test_command)
+          }, indent=2))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'outcome={outcome}\npatch_sha256={digest}\n')
+
+      - name: Preserve the patch and verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/security-result/
+          if-no-files-found: warn
+          retention-days: 3
+
+  publish:
+    needs: [request, remediate]
+    if: needs.remediate.outputs.outcome == 'verified'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    steps:
+      # No model, dependency setup, tests, or repository scripts run in this job.
+      - name: Check out the original revision for publication
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.request.outputs.base_sha }}
+
+      - name: Download the verified candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: security-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/security-result
+
+      - name: Check the verification record and patch digest
+        env:
+          BASE_SHA: ${{ needs.request.outputs.base_sha }}
+          PATCH_SHA256: ${{ needs.remediate.outputs.patch_sha256 }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib
+          directory = pathlib.Path(os.environ['RUNNER_TEMP']) / 'security-result'
+          patch = (directory / 'candidate.diff').read_bytes()
+          record = json.loads((directory / 'result.json').read_text())
+          checks = json.loads((directory / 'verification.json').read_text()).get('results', [])
+          assert patch and record['outcome'] == 'verified', 'No verified patch.'
+          assert record['base_sha'] == os.environ['BASE_SHA'], 'Wrong base revision.'
+          assert hashlib.sha256(patch).hexdigest() == record['patch_sha256'] == os.environ['PATCH_SHA256'], 'Patch changed after verification.'
+          assert len(checks) == 1 and checks[0]['id'] == 'finding-1' and checks[0]['status'] == 'fixed' and checks[0]['evidence'].strip(), 'Verification was not fixed.'
+
+      - name: Commit and push the verified patch to a new branch
+        env:
+          ALERT_NUMBER: ${{ needs.request.outputs.alert_number }}
+        run: |
+          git config core.hooksPath /dev/null
+          git config core.fsmonitor false
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          branch="codex-security-fix/alert-${ALERT_NUMBER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch --create "$branch"
+          git apply --check --index "$RUNNER_TEMP/security-result/candidate.diff"
+          git apply --index "$RUNNER_TEMP/security-result/candidate.diff"
+          git -c commit.gpgsign=false commit -m "Fix code-scanning alert #${ALERT_NUMBER}"
+          git push origin "HEAD:refs/heads/$branch"
+
+      - name: Open the draft pull request
+        id: pr
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          ALERT_NUMBER: ${{ needs.request.outputs.alert_number }}
+          BASE_BRANCH: ${{ needs.request.outputs.base_branch }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const directory = path.join(process.env.RUNNER_TEMP, 'security-result');
+            const verification = JSON.parse(fs.readFileSync(path.join(directory, 'verification.json'), 'utf8'));
+            const record = JSON.parse(fs.readFileSync(path.join(directory, 'result.json'), 'utf8'));
+            const alertNumber = process.env.ALERT_NUMBER;
+            const head = `codex-security-fix/alert-${alertNumber}-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = [
+              `Fixes the code-scanning finding in [alert #${alertNumber}](${context.serverUrl}/${owner}/${repo}/security/code-scanning/${alertNumber}).`,
+              `Requested in issue #${context.issue.number}.`,
+              '**Codex Security verification:** fixed.',
+              verification.results[0].evidence.slice(0, 12000),
+              record.configured_tests_ran ? 'The configured repository test command passed.' : 'No additional repository test command was configured. Review the verification evidence for the checks performed.',
+              `[Workflow run and evidence](${runUrl}).`,
+              'Draft for human review. This workflow does not merge the PR or dismiss the alert.'
+            ].join('\n\n');
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo, head, base: process.env.BASE_BRANCH, draft: true,
+              title: `Fix code-scanning alert #${alertNumber}`, body
+            });
+            core.setOutput('pr_url', pr.html_url);
+
+  reply:
+    needs: [request, remediate, publish]
+    if: always() && needs.request.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Reply with the result
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PR_URL: ${{ needs.publish.outputs.pr_url }}
+          OUTCOME: ${{ needs.remediate.outputs.outcome }}
+          REMEDIATION_RESULT: ${{ needs.remediate.result }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            let body;
+            if (process.env.PR_URL) {
+              body = `Codex Security verified the candidate fix and opened a draft PR: ${process.env.PR_URL}`;
+            } else if (process.env.OUTCOME === 'no_change' && process.env.REMEDIATION_RESULT === 'success') {
+              body = 'Codex Security verified that the finding is already fixed in the checked-out code. No code changes or PR were needed.';
+            } else {
+              body = 'The codex-security-fix run did not complete with a verified draft PR. Check the failed step and verification evidence; no PR was automatically merged.';
+            }
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: context.issue.number,
+              body: `${body}\n\n[Run details and evidence](${runUrl}).`
+            });
