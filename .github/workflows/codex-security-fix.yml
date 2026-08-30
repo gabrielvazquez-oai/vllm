@@ -196,7 +196,7 @@ jobs:
           TEST_COMMAND: ${{ vars.SECURITY_FIX_TEST_COMMAND }}
         shell: python
         run: |
-          import hashlib, json, os, pathlib, subprocess, tempfile
+          import hashlib, json, os, pathlib, re, shutil, subprocess, tempfile, time
 
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           temp = pathlib.Path(os.environ['RUNNER_TEMP'])
@@ -214,6 +214,12 @@ jobs:
           clean_env = {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG', 'LD_LIBRARY_PATH') if k in os.environ}
           clean_env.update(CI='true', CODEX_SECURITY_STATE_DIR=str(temp / 'security-state'))
 
+          def redact(value):
+              text = str(value).replace(api_key, '[REDACTED]')
+              text = re.sub(r'\b(?:sk-[A-Za-z0-9_.*-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)', '[REDACTED]', text)
+              text = re.sub(r'(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]+', 'Bearer [REDACTED]', text)
+              return re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b', '[REDACTED]', text)
+
           def run_security(arguments, stdout, stderr):
               # patch/verify-fix use app-server, which ignores CODEX_API_KEY.
               # Use the Codex binary installed by the pinned Security package.
@@ -222,20 +228,49 @@ jobs:
                   credential_home = pathlib.Path(directory)
                   credential_home.chmod(0o700)
                   (credential_home / 'config.toml').write_text('cli_auth_credentials_store = "file"\n')
-                  agent_env = dict(clean_env, CODEX_HOME=str(credential_home))
+                  # Copy the helper from the trusted checkout before model execution.
+                  # Only the redacted diagnostic file leaves this credential directory.
+                  wrapper = credential_home / 'codex-diagnostics'
+                  shutil.copyfile(root / '.github/scripts/codex-security-diagnostics.py', wrapper)
+                  wrapper.chmod(0o700)
+                  agent_env = dict(clean_env, CODEX_HOME=str(credential_home),
+                      CODEX_CLI_PATH=str(wrapper), CODEX_DIAGNOSTICS_REAL_CLI=str(codex),
+                      RUST_LOG='warn')
                   login = subprocess.run([str(codex), 'login', '--with-api-key'],
                       input=api_key + '\n', text=True, cwd=temp, env=agent_env,
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                   if login.returncode != 0:
-                      detail = (login.stderr or login.stdout).replace(api_key, '***')[-2000:]
+                      detail = redact(login.stderr or login.stdout)[-2000:]
                       raise RuntimeError('Codex API-key login failed: ' + json.dumps(detail))
-                  return subprocess.run([str(cli), *arguments], cwd=root,
-                      env=agent_env, stdout=stdout, stderr=stderr)
+                  started = time.monotonic()
+                  process = None
+                  stage = arguments[0]
+                  try:
+                      process = subprocess.run([str(cli), *arguments], cwd=root,
+                          env=agent_env, stdout=stdout, stderr=stderr)
+                      return process
+                  finally:
+                      # Flush CLI output before redacting it, including successful runs.
+                      for path in {pathlib.Path(stdout.name), pathlib.Path(stderr.name)}:
+                          stdout.flush()
+                          stderr.flush()
+                          path.write_text(redact(path.read_text(errors='replace')))
+                      diagnostic = credential_home / 'app-server-diagnostics.jsonl'
+                      details = redact(diagnostic.read_text(errors='replace')) if diagnostic.is_file() else ''
+                      metadata = {'stage': stage, 'exit_code': process.returncode if process else None,
+                          'elapsed_seconds': round(time.monotonic() - started, 2),
+                          'app_server_diagnostics_captured': bool(details)}
+                      (result / f'{stage}-diagnostics.log').write_text(json.dumps(metadata) + '\n' + details)
               # TemporaryDirectory removes the credential before optional tests run.
 
           def command_failed(stage, returncode, log_path):
-              detail = log_path.read_text(errors='replace').replace(api_key, '***')
+              detail = redact(log_path.read_text(errors='replace'))
               log_path.write_text(detail)
+              diagnostic = result / ('patch-diagnostics.log' if log_path.name == 'patch.log' else 'verify-fix-diagnostics.log')
+              if diagnostic.is_file():
+                  detail += '\nApp-server diagnostics:\n' + diagnostic.read_text(errors='replace')
+              # JSON quoting prevents diagnostic text from becoming workflow commands.
+              print('Codex Security failure diagnostics: ' + json.dumps(detail[-12000:]), flush=True)
               raise RuntimeError(f'{stage} failed (exit {returncode}): ' + json.dumps(detail[-4000:]))
 
           def git(*args):
