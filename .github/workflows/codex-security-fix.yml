@@ -85,7 +85,7 @@ jobs:
 
   remediate:
     needs: request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -93,6 +93,19 @@ jobs:
       outcome: ${{ steps.fix.outputs.outcome }}
       patch_sha256: ${{ steps.fix.outputs.patch_sha256 }}
     steps:
+      - name: Prepare and check the Codex sandbox
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor-profiles apparmor-utils
+          sudo install -m 0644 \
+            /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          # Fail before model calls if user/network namespaces cannot start.
+          bwrap --die-with-parent --unshare-user --unshare-net \
+            --ro-bind / / -- /bin/true
+
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
