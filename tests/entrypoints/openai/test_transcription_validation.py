@@ -3,7 +3,8 @@
 # imports for guided decoding tests
 import io
 import json
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import librosa
 import numpy as np
@@ -13,6 +14,7 @@ import soundfile as sf
 from openai._base_client import AsyncAPIClient
 
 from vllm.assets.audio import AudioAsset
+from vllm.entrypoints.openai import serving_transcription
 
 from ...utils import RemoteOpenAIServer
 
@@ -29,6 +31,94 @@ def winning_call():
     path = AudioAsset('winning_call').get_local_path()
     with open(str(path), "rb") as f:
         yield f
+
+
+def _flac_audio(duration_s: float, sample_rate: int = 8000) -> bytes:
+    audio = np.zeros(round(duration_s * sample_rate), dtype=np.float32)
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, sample_rate, format="FLAC")
+    return buffer.getvalue()
+
+
+def _transcription_serving(max_duration_s: float):
+    serving = serving_transcription.OpenAIServingTranscription.__new__(
+        serving_transcription.OpenAIServingTranscription)
+    serving.max_audio_clip_s = max_duration_s
+    return serving
+
+
+@pytest.mark.asyncio
+async def test_audio_duration_rejected_before_decode():
+    serving = _transcription_serving(max_duration_s=1)
+    audio_data = _flac_audio(duration_s=2)
+    request = SimpleNamespace(language=None, prompt="")
+
+    assert len(audio_data) < 25 * 1024**2
+    with (patch.object(serving_transcription.librosa, "load") as decode,
+          pytest.raises(ValueError,
+                        match=r"Maximum clip duration \(1s\) exceeded")):
+        await serving._preprocess_transcription(request, audio_data)
+
+    decode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_audio_decode_is_bounded_when_metadata_underreports_duration():
+    serving = _transcription_serving(max_duration_s=30)
+    request = SimpleNamespace(language=None, prompt="")
+    audio_file = MagicMock(frames=29, samplerate=1, channels=1)
+    audio_file.__enter__.return_value = audio_file
+
+    with (patch.object(serving_transcription.soundfile,
+                       "SoundFile",
+                       return_value=audio_file),
+          patch.object(serving_transcription.librosa,
+                       "load",
+                       return_value=(MagicMock(), 22050)) as decode,
+          patch.object(serving_transcription.librosa,
+                       "get_duration",
+                       return_value=30.5),
+          pytest.raises(ValueError,
+                        match=r"Maximum clip duration \(30s\) exceeded")):
+        await serving._preprocess_transcription(request, b"audio")
+
+    decode.assert_called_once_with(audio_file, duration=31.0)
+
+
+@pytest.mark.asyncio
+async def test_audio_decoded_size_rejected_before_decode():
+    serving = _transcription_serving(max_duration_s=30)
+    request = SimpleNamespace(language=None, prompt="")
+    frames = serving_transcription.MAX_AUDIO_DECODE_BYTES // 4 + 1
+    audio_file = MagicMock(frames=frames,
+                           samplerate=frames,
+                           channels=1)
+    audio_file.__enter__.return_value = audio_file
+
+    with (patch.object(serving_transcription.soundfile,
+                       "SoundFile",
+                       return_value=audio_file),
+          patch.object(serving_transcription.librosa, "load") as decode,
+          pytest.raises(ValueError,
+                        match="Maximum decoded audio size exceeded")):
+        await serving._preprocess_transcription(request, b"audio")
+
+    decode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_audio_at_duration_limit_is_preserved():
+    serving = _transcription_serving(max_duration_s=1)
+    request = SimpleNamespace(language=None, prompt="keep this prompt")
+
+    prompt, duration = await serving._preprocess_transcription(
+        request, _flac_audio(duration_s=1))
+
+    audio, sample_rate = prompt["encoder_prompt"]["multi_modal_data"][
+        "audio"]
+    assert duration == pytest.approx(1)
+    assert librosa.get_duration(y=audio, sr=sample_rate) == pytest.approx(1)
+    assert prompt["decoder_prompt"].endswith(request.prompt)
 
 
 @pytest.mark.asyncio
