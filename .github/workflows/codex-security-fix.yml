@@ -103,6 +103,63 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Diagnose OpenAI API authentication
+        # Model-list permission is independent of Responses permission, so this
+        # diagnostic must not prevent a valid restricted key from reaching Codex.
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+        shell: python
+        run: |
+          import json, os, re, urllib.error, urllib.request
+
+          api_key = os.environ.get('OPENAI_API_KEY', '').strip()
+          if not api_key:
+              print('CODEX_SECURITY_API_KEY is empty or unavailable to this job.')
+              raise SystemExit(1)
+
+          def redacted(value):
+              text = str(value).replace(api_key, '[REDACTED]')
+              return re.sub(r'\bsk-[A-Za-z0-9_.*-]+', '[REDACTED]', text)
+
+          # An API error must never redirect the Authorization header elsewhere.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          request = urllib.request.Request('https://api.openai.com/v1/models', headers={
+              'Authorization': 'Bearer ' + api_key,
+              'Accept': 'application/json'
+          })
+          opener = urllib.request.build_opener(NoRedirect)
+          try:
+              with opener.open(request, timeout=20) as response:
+                  payload = json.load(response)
+                  model_ids = {model.get('id') for model in payload.get('data', []) if isinstance(model, dict)}
+                  print('OpenAI API check: HTTP 200. This key can list models from this runner.')
+                  print('Pinned CLI default model: gpt-5.6-sol. Present in model list: ' + str('gpt-5.6-sol' in model_ids))
+                  print('This does not test Responses write permission or generation access to the selected model.')
+          except urllib.error.HTTPError as error:
+              try:
+                  payload = json.loads(error.read(65536))
+                  details = payload.get('error', {})
+                  if not isinstance(details, dict):
+                      details = {}
+              except (ValueError, AttributeError):
+                  details = {}
+              print('OpenAI API diagnostic: ' + json.dumps({
+                  'http_status': error.code,
+                  'error_code': redacted(details.get('code', 'unknown')),
+                  'error_type': redacted(details.get('type', 'unknown')),
+                  'message': redacted(details.get('message', 'No JSON error message returned.'))[:2000],
+                  'request_id': redacted(error.headers.get('x-request-id', 'unavailable'))
+              }))
+              print('This GET request is diagnostic only; model-list permission can differ from Responses permission.')
+              raise SystemExit(1)
+          except (urllib.error.URLError, TimeoutError, ValueError) as error:
+              print('OpenAI API diagnostic could not complete: ' + json.dumps(redacted(error)))
+              raise SystemExit(1)
+
       - name: Install the pinned Codex Security CLI outside the checkout
         run: >-
           npm install --prefix "$RUNNER_TEMP/security-cli"
