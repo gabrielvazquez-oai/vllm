@@ -28,6 +28,11 @@ try:
 except ImportError:
     librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
+try:
+    import soundfile
+except ImportError:
+    soundfile = PlaceholderModule("soundfile")  # type: ignore[assignment]
+
 logger = init_logger(__name__)
 
 # From https://platform.openai.com/docs/guides/speech-to-text/supported-languages#supported-languages
@@ -142,6 +147,8 @@ ISO639_1_OTHER_LANGS = {
 # As per https://platform.openai.com/docs/guides/speech-to-text#overview.
 # TODO configurable
 MAX_AUDIO_CLIP_FILESIZE_MB = 25
+MAX_AUDIO_DECODE_BYTES = 256 * 1024**2
+_AUDIO_DURATION_PROBE_S = 1.0
 
 
 class OpenAIServingTranscription(OpenAIServing):
@@ -202,7 +209,23 @@ class OpenAIServingTranscription(OpenAIServing):
             raise ValueError("Maximum file size exceeded.")
 
         with io.BytesIO(audio_data) as bytes_:
-            y, sr = librosa.load(bytes_)
+            with soundfile.SoundFile(bytes_) as audio_file:
+                metadata_duration = (audio_file.frames / audio_file.samplerate)
+                if metadata_duration > self.max_audio_clip_s:
+                    raise ValueError(
+                        f"Maximum clip duration ({self.max_audio_clip_s}s) "
+                        "exceeded.")
+
+                # librosa decodes source frames to float32 before resampling.
+                decoded_bytes = audio_file.frames * audio_file.channels * 4
+                if decoded_bytes > MAX_AUDIO_DECODE_BYTES:
+                    raise ValueError("Maximum decoded audio size exceeded.")
+
+                # The probe catches metadata that understates the duration
+                # without allowing an unbounded waveform allocation.
+                y, sr = librosa.load(
+                    audio_file,
+                    duration=self.max_audio_clip_s + _AUDIO_DURATION_PROBE_S)
 
         duration = librosa.get_duration(y=y, sr=sr)
         if duration > self.max_audio_clip_s:
