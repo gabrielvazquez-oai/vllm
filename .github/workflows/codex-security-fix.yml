@@ -122,7 +122,7 @@ jobs:
           path: ${{ runner.temp }}/security-request
 
       # Optional repository variables, maintained by repository administrators.
-      # For example: SETUP = npm ci; TEST = npm test -- --runInBand
+      # Leave unset unless you have setup/test commands appropriate for this repository.
       - name: Install repository dependencies if configured
         env:
           SETUP_COMMAND: ${{ vars.SECURITY_FIX_SETUP_COMMAND }}
@@ -139,22 +139,47 @@ jobs:
           TEST_COMMAND: ${{ vars.SECURITY_FIX_TEST_COMMAND }}
         shell: python
         run: |
-          import hashlib, json, os, pathlib, subprocess
+          import hashlib, json, os, pathlib, subprocess, tempfile
 
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           temp = pathlib.Path(os.environ['RUNNER_TEMP'])
           result = temp / 'security-result'
           result.mkdir(exist_ok=True)
           cli = temp / 'security-cli/node_modules/.bin/codex-security'
+          codex = temp / 'security-cli/node_modules/.bin/codex'
           alert = temp / 'security-request/alert.json'
           base = os.environ['BASE_SHA']
-          if not os.environ.get('CODEX_API_KEY'):
+          api_key = os.environ.get('CODEX_API_KEY', '').strip()
+          if not api_key:
               raise RuntimeError('Add the CODEX_SECURITY_API_KEY Actions secret.')
 
           # Do not pass GitHub tokens or workflow control-file paths to Codex.
-          clean_env = {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG') if k in os.environ}
+          clean_env = {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG', 'LD_LIBRARY_PATH') if k in os.environ}
           clean_env.update(CI='true', CODEX_SECURITY_STATE_DIR=str(temp / 'security-state'))
-          agent_env = dict(clean_env, CODEX_API_KEY=os.environ['CODEX_API_KEY'])
+
+          def run_security(arguments, stdout, stderr):
+              # patch/verify-fix use app-server, which ignores CODEX_API_KEY.
+              # Use the Codex binary installed by the pinned Security package.
+              # Configure an isolated credential home only for these subprocesses.
+              with tempfile.TemporaryDirectory(prefix='codex-security-auth-', dir=temp) as directory:
+                  credential_home = pathlib.Path(directory)
+                  credential_home.chmod(0o700)
+                  (credential_home / 'config.toml').write_text('cli_auth_credentials_store = "file"\n')
+                  agent_env = dict(clean_env, CODEX_HOME=str(credential_home))
+                  login = subprocess.run([str(codex), 'login', '--with-api-key'],
+                      input=api_key + '\n', text=True, cwd=temp, env=agent_env,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  if login.returncode != 0:
+                      detail = (login.stderr or login.stdout).replace(api_key, '***')[-2000:]
+                      raise RuntimeError('Codex API-key login failed: ' + json.dumps(detail))
+                  return subprocess.run([str(cli), *arguments], cwd=root,
+                      env=agent_env, stdout=stdout, stderr=stderr)
+              # TemporaryDirectory removes the credential before optional tests run.
+
+          def command_failed(stage, returncode, log_path):
+              detail = log_path.read_text(errors='replace').replace(api_key, '***')
+              log_path.write_text(detail)
+              raise RuntimeError(f'{stage} failed (exit {returncode}): ' + json.dumps(detail[-4000:]))
 
           def git(*args):
               return subprocess.check_output([
@@ -184,8 +209,9 @@ jobs:
           if git('status', '--porcelain').strip():
               raise RuntimeError('Repository setup must leave a clean Git checkout.')
           with (result / 'patch.log').open('w') as log:
-              subprocess.run([str(cli), 'patch', str(alert)], cwd=root,
-                             env=agent_env, stdout=log, stderr=log, check=True)
+              patch_process = run_security(['patch', str(alert)], stdout=log, stderr=log)
+          if patch_process.returncode != 0:
+              command_failed('Codex Security patch', patch_process.returncode, result / 'patch.log')
           patch = candidate()
 
           # A configured test command receives no OpenAI or GitHub credentials.
@@ -198,11 +224,12 @@ jobs:
                   raise RuntimeError('Tests modified the candidate patch.')
 
           with (result / 'verification.json').open('w') as out, (result / 'verification.log').open('w') as log:
-              verification = subprocess.run([str(cli), 'verify-fix', str(alert), '--json'],
-                  cwd=root, env=agent_env, stdout=out, stderr=log)
+              verification = run_security(['verify-fix', str(alert), '--json'], stdout=out, stderr=log)
+          if verification.returncode != 0:
+              command_failed('Codex Security verification', verification.returncode, result / 'verification.log')
           data = json.loads((result / 'verification.json').read_text())
           checks = data.get('results', [])
-          if verification.returncode != 0 or len(checks) != 1:
+          if len(checks) != 1:
               raise RuntimeError('Verification failed or was inconclusive; no PR will be created.')
           check = checks[0]
           if check.get('id') != 'finding-1' or check.get('status') != 'fixed' or not check.get('evidence', '').strip():
